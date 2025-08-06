@@ -7,7 +7,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 OWNER_CHAT_ID = os.getenv('OWNER_CHAT_ID')
 
 # מספר וואטסאפ (החלף למספר שלך - בפורמט +972501234567)
-WHATSAPP_NUMBER = os.getenv('WHATSAPP_NUMBER', '+972501234567')
+WHATSAPP_NUMBER = os.getenv('WHATSAPP_NUMBER', '+972543978620')
 
 # הגדרות כלליות
 DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
