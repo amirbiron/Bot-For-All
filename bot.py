@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import os
+import threading
+from flask import Flask, jsonify
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -63,6 +65,22 @@ REQUEST_RECEIVED = """
 
 # משתנה לאחסון מצב המשתמש
 user_states = {}
+
+# Flask application for Render deployment
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "bot": "running"})
+
+def run_flask():
+    """Run Flask server in a separate thread"""
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 def create_main_keyboard():
     """יוצר את המקלדת הראשית"""
@@ -172,6 +190,11 @@ def main():
     
     if not OWNER_CHAT_ID:
         logger.warning("OWNER_CHAT_ID לא מוגדר - לא תתקבלנה הודעות")
+    
+    # Start Flask server in a separate thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("Flask server started")
     
     # יצירת האפליקציה
     application = Application.builder().token(BOT_TOKEN).build()
