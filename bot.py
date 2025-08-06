@@ -95,6 +95,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     logger.info(f"המשתמש {user.full_name} התחיל שיחה")
     
+    # אפס את מצב המשתמש
+    user_states[user.id] = None
+    
     await update.message.reply_text(
         WELCOME_MESSAGE,
         reply_markup=create_main_keyboard()
@@ -102,7 +105,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def handle_whatsapp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בכפתור וואטסאפ"""
-    whatsapp_number = "+972501234567"  # החלף למספר שלך
+    from config import WHATSAPP_NUMBER
+    whatsapp_number = WHATSAPP_NUMBER
     whatsapp_link = f"https://wa.me/{whatsapp_number.replace('+', '')}"
     
     await update.message.reply_text(
@@ -143,23 +147,21 @@ async def handle_callback_request(update: Update, context: ContextTypes.DEFAULT_
         reply_markup=create_main_keyboard()
     )
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """טיפול בהודעות רגילות"""
+async def handle_contact_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """טיפול בפרטי קשר שהמשתמש שלח"""
     user = update.effective_user
     user_id = user.id
     message_text = update.message.text
     
-    # בדיקה אם המשתמש בתהליך השארת פרטים
-    if user_id in user_states and user_states[user_id] == 'waiting_for_details':
-        # שליחת הודעה למשתמש
-        await update.message.reply_text(
-            REQUEST_RECEIVED,
-            reply_markup=create_main_keyboard()
-        )
-        
-        # שליחת הודעה לבעל הבוט
-        if OWNER_CHAT_ID:
-            notification = f"""
+    # שליחת הודעה למשתמש
+    await update.message.reply_text(
+        REQUEST_RECEIVED,
+        reply_markup=create_main_keyboard()
+    )
+    
+    # שליחת הודעה לבעל הבוט
+    if OWNER_CHAT_ID:
+        notification = f"""
 🔔 **פנייה חדשה מהבוט!**
 
 **מהמשתמש:** {user.full_name} (@{user.username or 'אין username'})
@@ -170,24 +172,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 **זמן:** {update.message.date.strftime('%d/%m/%Y %H:%M')}
 """
-            try:
-                await context.bot.send_message(chat_id=OWNER_CHAT_ID, text=notification, parse_mode='Markdown')
-            except Exception as e:
-                logger.error(f"שגיאה בשליחת הודעה לבעל הבוט: {e}")
-        
-        # איפוס מצב המשתמש
-        user_states.pop(user_id, None)
-        
-    elif message_text == "💬 צור קשר בוואטסאפ":
+        try:
+            await context.bot.send_message(chat_id=OWNER_CHAT_ID, text=notification, parse_mode='Markdown')
+        except Exception as e:
+            logger.error(f"שגיאה בשליחת הודעה לבעל הבוט: {e}")
+    
+    # איפוס מצב המשתמש
+    user_states.pop(user_id, None)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """טיפול בהודעות טקסט רגילות"""
+    user = update.effective_user
+    text = update.message.text
+    
+    # טיפול בכפתורים ראשונים - לפני בדיקת מצב המשתמש
+    if text == "💬 צור קשר בוואטסאפ":
         await handle_whatsapp(update, context)
-    elif message_text == "ℹ️ מידע על השירות":
+    elif text == "ℹ️ מידע על השירות":
         await handle_info(update, context)
-    elif message_text == "⏳ בקשה שאחזור ללקוח":
+    elif text == "⏳ בקשה שאחזור ללקוח":
         await handle_callback_request(update, context)
-    elif message_text == "📤 שלח לחבר שרוצה בוט":
+    elif text == "📤 שלח לחבר שרוצה בוט":
         await handle_share_friend(update, context)
+    # רק אחרי זה בודק אם המשתמש במצב המתנה לפרטים
+    elif user.id in user_states and user_states[user.id] == 'waiting_for_details':
+        await handle_contact_details(update, context)
     else:
-        # הודעה ברירת מחדל
         await update.message.reply_text(
             "אני כאן לעזור! בחר באחת מהאפשרויות למטה 👇",
             reply_markup=create_main_keyboard()
