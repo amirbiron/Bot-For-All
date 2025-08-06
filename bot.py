@@ -85,7 +85,8 @@ def create_main_keyboard():
     keyboard = [
         [KeyboardButton("💬 צור קשר בוואטסאפ")],
         [KeyboardButton("ℹ️ מידע על השירות")],
-        [KeyboardButton("⏳ בקשה שאחזור ללקוח")]
+        [KeyboardButton("⏳ בקשה שאחזור ללקוח")],
+        [KeyboardButton("📤 שלח לחבר שרוצה בוט")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
 
@@ -115,6 +116,20 @@ async def handle_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         SERVICE_INFO,
         parse_mode='Markdown',
+        reply_markup=create_main_keyboard()
+    )
+
+async def handle_share_friend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """טיפול בכפתור שלח לחבר"""
+    share_message = """ראיתי בוט שעוזר לבנות בוטים לטלגרם בקלות ובמחיר נוח.
+    
+אם מעניין אותך - 
+https://t.me/BotForAll4_Bot
+
+(אפשר לפנות ישירות ולספר מה צריך)"""
+    
+    await update.message.reply_text(
+        share_message,
         reply_markup=create_main_keyboard()
     )
 
@@ -169,6 +184,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await handle_info(update, context)
     elif message_text == "⏳ בקשה שאחזור ללקוח":
         await handle_callback_request(update, context)
+    elif message_text == "📤 שלח לחבר שרוצה בוט":
+        await handle_share_friend(update, context)
     else:
         # הודעה ברירת מחדל
         await update.message.reply_text(
