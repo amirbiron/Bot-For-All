@@ -77,11 +77,11 @@ class TestMessages:
     
     def test_whatsapp_message_formatting(self):
         """בדיקה שהודעת וואטסאפ מעוצבת נכון"""
-        phone = "+972501234567"
-        result = messages.get_whatsapp_message(phone)
+        result = messages.get_whatsapp_message()
         
         assert "wa.me" in result
-        assert "972501234567" in result
+        # בודק שהמספר מה-config משתמש בהודעה
+        assert "972543978620" in result
 
 class TestDatabase:
     """בדיקות מסד הנתונים"""
