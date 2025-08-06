@@ -2,6 +2,8 @@
 קובץ המכיל את כל ההודעות והטקסטים של הבוט
 """
 
+from config import WHATSAPP_NUMBER
+
 # הודעות ראשיות
 WELCOME_MESSAGE = """
 היי! 👋 
@@ -109,9 +111,9 @@ STEPS = {
     }
 }
 
-def get_whatsapp_message(phone_number):
+def get_whatsapp_message():
     """מחזיר הודעת וואטסאפ עם הקישור"""
-    clean_number = phone_number.replace('+', '').replace('-', '').replace(' ', '')
+    clean_number = WHATSAPP_NUMBER.replace('+', '').replace('-', '').replace(' ', '')
     whatsapp_link = f"https://wa.me/{clean_number}"
     return WHATSAPP_MESSAGE.format(whatsapp_link=whatsapp_link)
 
