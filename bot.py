@@ -3,6 +3,8 @@ import logging
 import os
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from flask import Flask, jsonify
+import threading
 
 # הגדרת לוגים
 logging.basicConfig(
@@ -10,6 +12,22 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# יצירת Flask app
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "bot": "running"})
+
+def run_flask():
+    """מפעיל את Flask בחוט נפרד"""
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
 
 # הגדרות מהסביבה
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -172,6 +190,12 @@ def main():
     
     if not OWNER_CHAT_ID:
         logger.warning("OWNER_CHAT_ID לא מוגדר - לא תתקבלנה הודעות")
+    
+    # הפעלת Flask בחוט נפרד
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    logger.info("Flask server started")
     
     # יצירת האפליקציה
     application = Application.builder().token(BOT_TOKEN).build()
