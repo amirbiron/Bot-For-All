@@ -35,6 +35,9 @@ LOCK_LEASE_SECONDS = int(os.environ.get('LOCK_LEASE_SECONDS', '60'))
 LOCK_HEARTBEAT_INTERVAL = max(5, int(LOCK_LEASE_SECONDS * 0.4))
 LOCK_WAIT_FOR_ACQUIRE = os.environ.get('LOCK_WAIT_FOR_ACQUIRE', 'false').lower() == 'true'
 LOCK_ACQUIRE_MAX_WAIT = int(os.environ.get('LOCK_ACQUIRE_MAX_WAIT', '0'))  # 0 = ללא גבול
+# זמני המתנה פסיביים כאשר לא ממתינים אקטיבית
+LOCK_WAIT_MIN_SECONDS = int(os.environ.get('LOCK_WAIT_MIN_SECONDS', '15'))
+LOCK_WAIT_MAX_SECONDS = int(os.environ.get('LOCK_WAIT_MAX_SECONDS', '45'))
 
 # אתחול לוגים גלובלי (JSON/Text לפי ENV) + קונטקסט שירות
 setup_logging({
@@ -135,6 +138,17 @@ def _start_heartbeat(client):
     _lock_heartbeat_thread = threading.Thread(target=_beat, daemon=True)
     _lock_heartbeat_thread.start()
 
+def _sleep_when_locked():
+    """המתנה עם backoff אקראי כאשר הנעילה תפוסה כדי למנוע לולאת ריסטארטים."""
+    try:
+        lo = max(1, int(LOCK_WAIT_MIN_SECONDS))
+        hi = max(lo, int(LOCK_WAIT_MAX_SECONDS))
+    except Exception:
+        lo, hi = 15, 45
+    delay = random.randint(lo, hi)
+    logger.info(f"נעילה תפוסה – ממתין {delay}s ומנסה שוב")
+    time.sleep(delay)
+
 def cleanup_mongo_lock():
     """שחרור הנעילה והפסקת heartbeat בעת יציאה."""
     try:
@@ -162,7 +176,8 @@ def manage_mongo_lock():
         attempt = 0
         logger.info(
             f"מתחיל ניסיון רכישת נעילה (lease={LOCK_LEASE_SECONDS}s, heartbeat={LOCK_HEARTBEAT_INTERVAL}s, "
-            f"wait={'on' if LOCK_WAIT_FOR_ACQUIRE else 'off'}, max_wait={LOCK_ACQUIRE_MAX_WAIT or '∞'})"
+            f"wait={'on' if LOCK_WAIT_FOR_ACQUIRE else 'off'}, max_wait={LOCK_ACQUIRE_MAX_WAIT or '∞'}, "
+            f"linger_when_denied={'on' if not LOCK_WAIT_FOR_ACQUIRE else 'off'})"
         )
         while True:
             attempt += 1
@@ -215,11 +230,12 @@ def manage_mongo_lock():
                     pass
 
                 if not LOCK_WAIT_FOR_ACQUIRE:
-                    logger.info("תהליך אחר מחזיק בנעילה - יוצא נקי (LOCK_WAIT_FOR_ACQUIRE=false)")
-                    sys.exit(0)
+                    logger.info("תהליך אחר מחזיק בנעילה - ממתין בפאסיביות כדי למנוע לולאת ריסטארטים (LOCK_WAIT_FOR_ACQUIRE=false)")
+                    _sleep_when_locked()
+                    continue
 
                 waited = time.time() - start_time
-                if LOCK_ACQUIRE_MAX_WAIT and waited >= LOCK_ACQUIRE_MAX_WAIT:
+                if LOCK_WAIT_FOR_ACQUIRE and LOCK_ACQUIRE_MAX_WAIT and waited >= LOCK_ACQUIRE_MAX_WAIT:
                     logger.error(f"חרגנו מזמן ההמתנה לנעילה אחרי {int(waited)} שניות - יוצא כדי למנוע קונפליקט")
                     sys.exit(0)
 
@@ -233,7 +249,8 @@ def manage_mongo_lock():
                 logger.error(f"שגיאה בניסיון רכישת נעילת MongoDB (attempt={attempt}): {e}")
                 time.sleep(1.0)
                 if attempt >= 5 and not LOCK_WAIT_FOR_ACQUIRE:
-                    sys.exit(0)
+                    _sleep_when_locked()
+                    continue
 
     except Exception as e:
         logger.error(f"שגיאה בניהול נעילת MongoDB: {e}")
