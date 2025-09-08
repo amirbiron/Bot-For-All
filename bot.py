@@ -1,15 +1,28 @@
 import asyncio
 import logging
 import os
+import sys
+import atexit
+import time
+import random
+from datetime import datetime, timedelta, timezone
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.error import Conflict
 from flask import Flask, jsonify
 import threading
+<<<<<<< HEAD
 import database
 try:
     from activity_reporter import create_reporter
 except Exception:
     create_reporter = None
+=======
+import pymongo
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
+from activity_reporter import create_reporter
+>>>>>>> origin/main
 
 # הגדרת לוגים
 logging.basicConfig(
@@ -38,6 +51,7 @@ def run_flask():
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 OWNER_CHAT_ID = os.getenv('OWNER_CHAT_ID')
 
+<<<<<<< HEAD
 # אתחול activity reporter
 class _NoopReporter:
     def report_activity(self, *args, **kwargs):
@@ -55,6 +69,168 @@ if create_reporter is not None:
         reporter = _NoopReporter()
 else:
     reporter = _NoopReporter()
+=======
+# יצירת activity reporter
+reporter = create_reporter(
+    mongodb_uri="mongodb+srv://mumin:M43M2TFgLfGvhBwY@muminai.tm6x81b.mongodb.net/?retryWrites=true&w=majority&appName=muminAI",
+    service_id="srv-d29qsb1r0fns73e52vig",
+    service_name="BotForAll"
+)
+
+# MongoDB URI לנעילה
+MONGODB_URI = os.environ.get('MONGODB_URI') or "mongodb+srv://mumin:M43M2TFgLfGvhBwY@muminai.tm6x81b.mongodb.net/?retryWrites=true&w=majority&appName=muminAI"
+SERVICE_ID = os.environ.get('SERVICE_ID') or "srv-d29qsb1r0fns73e52vig"
+INSTANCE_ID = os.environ.get('RENDER_INSTANCE_ID') or f"pid-{os.getpid()}"
+
+# פרמטרים לנעילה (Lease + Heartbeat)
+LOCK_LEASE_SECONDS = int(os.environ.get('LOCK_LEASE_SECONDS', '60'))
+LOCK_HEARTBEAT_INTERVAL = max(5, int(LOCK_LEASE_SECONDS * 0.4))
+LOCK_WAIT_FOR_ACQUIRE = os.environ.get('LOCK_WAIT_FOR_ACQUIRE', 'false').lower() == 'true'
+LOCK_ACQUIRE_MAX_WAIT = int(os.environ.get('LOCK_ACQUIRE_MAX_WAIT', '0'))  # 0 = ללא גבול
+
+# אובייקטים גלובליים לניהול heartbeat
+_lock_stop_event = threading.Event()
+_lock_heartbeat_thread = None
+
+def _ensure_lock_indexes(collection):
+    """יוצר אינדקס TTL על expiresAt ואינדקס ייחודי על _id (מובנה)."""
+    try:
+        # TTL על expiresAt (expireAfterSeconds=0 כדי שיפוג בדיוק בזמן)
+        collection.create_index("expiresAt", expireAfterSeconds=0, background=True)
+    except Exception as e:
+        logger.warning(f"יצירת אינדקס TTL נכשלה/כבר קיים: {e}")
+
+def _start_heartbeat(client):
+    """מפעיל heartbeat חוטי שמאריך את ה-lease עד שהבוט נסגר."""
+    global _lock_heartbeat_thread
+
+    def _beat():
+        collection = client.bot_locks.service_locks
+        while not _lock_stop_event.is_set():
+            time.sleep(LOCK_HEARTBEAT_INTERVAL)
+            now = datetime.now(timezone.utc)
+            new_expiry = now + timedelta(seconds=LOCK_LEASE_SECONDS)
+            try:
+                res = collection.update_one(
+                    {"_id": SERVICE_ID, "owner": INSTANCE_ID},
+                    {"$set": {"expiresAt": new_expiry, "updatedAt": now}}
+                )
+                if res.matched_count == 0:
+                    logger.error("איבדנו את הנעילה במהלך הריצה - יוצא כדי למנוע קונפליקט")
+                    os._exit(0)
+            except Exception as e:
+                logger.error(f"שגיאה בעדכון heartbeat לנעילה: {e}")
+                # נסיון נוסף בסיבוב הבא; אם זה נמשך, ה-TTL ישחרר לבד
+
+    _lock_heartbeat_thread = threading.Thread(target=_beat, daemon=True)
+    _lock_heartbeat_thread.start()
+
+def cleanup_mongo_lock():
+    """שחרור הנעילה והפסקת heartbeat בעת יציאה."""
+    try:
+        _lock_stop_event.set()
+        client = pymongo.MongoClient(MONGODB_URI)
+        db = client.bot_locks
+        collection = db.service_locks
+        result = collection.delete_one({"_id": SERVICE_ID, "owner": INSTANCE_ID})
+        if result.deleted_count > 0:
+            logger.info("נעילת MongoDB שוחררה בהצלחה")
+        else:
+            logger.debug("לא נמצאה נעילה בבעלותנו למחיקה")
+    except Exception as e:
+        logger.error(f"שגיאה בשחרור נעילת MongoDB: {e}")
+
+def manage_mongo_lock():
+    """רכישת נעילה מבוזרת (Lease) עם Heartbeat ו-TTL, עם המתנה אופציונלית לרכישה."""
+    try:
+        client = pymongo.MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+        db = client.bot_locks
+        collection = db.service_locks
+        _ensure_lock_indexes(collection)
+
+        start_time = time.time()
+        attempt = 0
+        while True:
+            attempt += 1
+            now = datetime.now(timezone.utc)
+            new_expiry = now + timedelta(seconds=LOCK_LEASE_SECONDS)
+            try:
+                # שלב 1: נסה לתפוס/להאריך נעילה קיימת שפגה או בבעלותנו (ללא upsert)
+                doc = collection.find_one_and_update(
+                    {
+                        "_id": SERVICE_ID,
+                        "$or": [
+                            {"expiresAt": {"$lte": now}},
+                            {"owner": INSTANCE_ID},
+                        ]
+                    },
+                    {
+                        "$set": {
+                            "owner": INSTANCE_ID,
+                            "host": os.environ.get('RENDER_SERVICE_NAME', 'unknown'),
+                            "updatedAt": now,
+                            "expiresAt": new_expiry,
+                        },
+                        "$setOnInsert": {"createdAt": now},
+                    },
+                    upsert=False,
+                    return_document=ReturnDocument.AFTER,
+                )
+
+                if doc and doc.get("owner") == INSTANCE_ID:
+                    logger.info(f"נעילת MongoDB נרכשה בהצלחה עבור {SERVICE_ID} (instance: {INSTANCE_ID})")
+                    _start_heartbeat(client)
+                    atexit.register(cleanup_mongo_lock)
+                    return
+
+                # שלב 2: אם אין נעילה שתפוג או בבעלותנו, אז ננסה ליצור חדשה באמצעות insert
+                try:
+                    collection.insert_one(
+                        {
+                            "_id": SERVICE_ID,
+                            "owner": INSTANCE_ID,
+                            "host": os.environ.get('RENDER_SERVICE_NAME', 'unknown'),
+                            "createdAt": now,
+                            "updatedAt": now,
+                            "expiresAt": new_expiry,
+                        }
+                    )
+                    logger.info(f"נעילת MongoDB נוצרה ונרכשה בהצלחה עבור {SERVICE_ID} (instance: {INSTANCE_ID})")
+                    _start_heartbeat(client)
+                    atexit.register(cleanup_mongo_lock)
+                    return
+                except DuplicateKeyError:
+                    # תהליך אחר יצר את הרשומה במקביל — מתייחסים כ"נעילה לא הושגה"
+                    pass
+
+                # לא נרכשה - יש בעלים אחר ועדיין בתוקף
+                if not LOCK_WAIT_FOR_ACQUIRE:
+                    logger.info("תהליך אחר מחזיק בנעילה - יוצא נקי")
+                    sys.exit(0)
+
+                # המתנה עם backoff ואקראיות קלה כדי לצמצם מירוצים
+                waited = time.time() - start_time
+                if LOCK_ACQUIRE_MAX_WAIT and waited >= LOCK_ACQUIRE_MAX_WAIT:
+                    logger.error("חרגנו מזמן ההמתנה לנעילה - יוצא כדי למנוע קונפליקט")
+                    sys.exit(0)
+
+                sleep_s = min(5.0, 0.5 + random.random())
+                if attempt % 20 == 0:
+                    logger.info("ממתין לשחרור נעילה מתהליך אחר...")
+                time.sleep(sleep_s)
+                continue
+
+            except Exception as e:
+                logger.error(f"שגיאה בניסיון רכישת נעילת MongoDB: {e}")
+                time.sleep(1.0)
+                if attempt >= 5 and not LOCK_WAIT_FOR_ACQUIRE:
+                    sys.exit(0)
+
+    except Exception as e:
+        logger.error(f"שגיאה בניהול נעילת MongoDB: {e}")
+        logger.error("לא ניתן להבטיח נעילה - יוצא כדי למנוע קונפליקט")
+        sys.exit(0)
+>>>>>>> origin/main
 
 # הודעות
 WELCOME_MESSAGE = """
@@ -247,6 +423,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """טיפול בהודעות טקסט רגילות"""
     reporter.report_activity(update.effective_user.id)
     user = update.effective_user
+    reporter.report_activity(user.id)
     text = update.message.text
     
     # טיפול בכפתורים ראשונים - לפני בדיקת מצב המשתמש
@@ -271,9 +448,122 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception as e:
             logger.debug(f"log_action free_text_message נכשל: {e}")
 
+async def stats_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """הצגת סטטיסטיקות שבועיות - רק לבעל הבוט"""
+    user = update.effective_user
+    
+    # בדיקה שזה בעל הבוט
+    if str(user.id) != OWNER_CHAT_ID:
+        await update.message.reply_text("אין לך הרשאה לצפות בסטטיסטיקות.")
+        return
+    
+    reporter.report_activity(user.id)
+    
+    # קבלת סטטיסטיקות שבועיות
+    stats = reporter.get_weekly_stats()
+    
+    if "error" in stats:
+        await update.message.reply_text(f"שגיאה בקבלת סטטיסטיקות: {stats['error']}")
+        return
+    
+    # עיצוב הודעת הסטטיסטיקות
+    message = f"""📊 **סטטיסטיקות שימוש - {stats['period']}**
+
+👥 **משתמשים ייחודיים:** {stats['unique_users']}
+🔄 **סך הפעילויות:** {stats['total_activities']}
+
+📅 **פירוט יומי:**"""
+    
+    # הוספת פירוט יומי
+    for day_stat in stats['daily_breakdown'][:7]:  # רק 7 הימים האחרונים
+        date_formatted = day_stat['date']
+        users_count = day_stat['unique_users_count']
+        activities_count = day_stat['total_activities']
+        message += f"\n• {date_formatted}: {users_count} משתמשים, {activities_count} פעילויות"
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def stats_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """הצגת סטטיסטיקות חודשיות - רק לבעל הבוט"""
+    user = update.effective_user
+    
+    # בדיקה שזה בעל הבוט
+    if str(user.id) != OWNER_CHAT_ID:
+        await update.message.reply_text("אין לך הרשאה לצפות בסטטיסטיקות.")
+        return
+    
+    reporter.report_activity(user.id)
+    
+    # קבלת סטטיסטיקות חודשיות
+    stats = reporter.get_monthly_stats()
+    
+    if "error" in stats:
+        await update.message.reply_text(f"שגיאה בקבלת סטטיסטיקות: {stats['error']}")
+        return
+    
+    # עיצוב הודעת הסטטיסטיקות
+    message = f"""📊 **סטטיסטיקות שימוש - {stats['period']}**
+
+👥 **משתמשים ייחודיים:** {stats['unique_users']}
+🔄 **סך הפעילויות:** {stats['total_activities']}
+
+📅 **פירוט יומי (10 הימים האחרונים):**"""
+    
+    # הוספת פירוט יומי - רק 10 הימים האחרונים
+    for day_stat in stats['daily_breakdown'][:10]:
+        date_formatted = day_stat['date']
+        users_count = day_stat['unique_users_count']
+        activities_count = day_stat['total_activities']
+        message += f"\n• {date_formatted}: {users_count} משתמשים, {activities_count} פעילויות"
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """הצגת עזרה לבעל הבוט"""
+    user = update.effective_user
+    
+    # בדיקה שזה בעל הבוט
+    if str(user.id) != OWNER_CHAT_ID:
+        await update.message.reply_text("אין לך הרשאה לצפות בפקודות ניהול.")
+        return
+    
+    reporter.report_activity(user.id)
+    
+    help_message = """🔧 **פקודות ניהול זמינות:**
+
+📊 `/stats_week` - סטטיסטיקות שימוש לשבוע האחרון
+📊 `/stats_month` - סטטיסטיקות שימוש לחודש האחרון
+❓ `/admin_help` - הצגת רשימת פקודות זו
+
+**הערה:** כל הפקודות זמינות רק לבעל הבוט.
+
+**להגדרת פקודות ב-BotFather:**
+```
+start - התחל שיחה עם הבוט
+stats_week - סטטיסטיקות שבועיות (אדמין)
+stats_month - סטטיסטיקות חודשיות (אדמין) 
+admin_help - עזרה לאדמין (אדמין)
+```"""
+    
+    await update.message.reply_text(help_message, parse_mode='Markdown')
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בשגיאות"""
-    logger.error(f"שגיאה: {context.error}")
+    err = context.error
+    # במקרה של Conflict שמגיע מעומק ה-Polling, נתעד ברמה נמוכה יותר
+    if isinstance(err, Conflict) or (hasattr(err, "message") and "Conflict" in str(err)):
+        logger.warning("זוהתה התנגשות getUpdates (Conflict) - ייתכן שתהליך אחר התחיל. נסגר בחן.")
+        return
+    logger.error(f"שגיאה: {err}")
+
+async def _post_init(application: Application) -> None:
+    """Callback אסינכרוני שירוץ בעת אתחול האפליקציה בתוך הלופ של PTB.
+    משמש להסרת webhook מבלי לפתוח/לסגור event loop חיצוני."""
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook הוסר בהצלחה (אם היה)")
+    except Exception as e:
+        logger.warning(f"נכשלה הסרת webhook: {e}")
 
 def _is_admin(user_id: int) -> bool:
     """בודק אם המשתמש הוא האדמין המוגדר"""
@@ -324,6 +614,9 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 def main():
     """פונקציה ראשית"""
+    # ניהול נעילת MongoDB למניעת ריצה מרובה
+    manage_mongo_lock()
+    
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN לא מוגדר!")
         return
@@ -337,12 +630,24 @@ def main():
     flask_thread.start()
     logger.info("Flask server started")
     
-    # יצירת האפליקציה
-    application = Application.builder().token(BOT_TOKEN).build()
+    # יצירת האפליקציה + הסרת webhook בתוך ה-loop של PTB באמצעות post_init
+    application = (
+        Application
+        .builder()
+        .token(BOT_TOKEN)
+        .post_init(_post_init)
+        .build()
+    )
     
     # הוספת handlers
     application.add_handler(CommandHandler("start", start))
+<<<<<<< HEAD
     application.add_handler(CommandHandler("admin_stats", admin_stats))
+=======
+    application.add_handler(CommandHandler("stats_week", stats_week))
+    application.add_handler(CommandHandler("stats_month", stats_month))
+    application.add_handler(CommandHandler("admin_help", admin_help))
+>>>>>>> origin/main
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # הוספת error handler
@@ -351,7 +656,17 @@ def main():
     logger.info("הבוט מתחיל לפעול...")
     
     # הפעלת הבוט
-    application.run_polling(drop_pending_updates=True)
+    # הבטחת event loop ברירת מחדל עבור Python 3.13 לפני קריאה פנימית ל-asyncio.get_event_loop()
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+    try:
+        application.run_polling(drop_pending_updates=True)
+    except Conflict:
+        # אם בכל זאת קרה, נסיים בשקט כדי לא לזהם לוגים
+        logger.info("Conflict מזוהה בעת run_polling - יוצא נקי (instance אחר פעיל)")
+        return
 
 if __name__ == '__main__':
     main()
