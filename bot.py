@@ -3,13 +3,16 @@ import logging
 import os
 import sys
 import atexit
+import time
+import random
 from datetime import datetime, timedelta, timezone
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.error import Conflict
 from flask import Flask, jsonify
 import threading
 import pymongo
-from pymongo.errors import DuplicateKeyError
+from pymongo import ReturnDocument
 from activity_reporter import create_reporter
 
 # הגדרת לוגים
@@ -47,68 +50,135 @@ reporter = create_reporter(
 )
 
 # MongoDB URI לנעילה
-MONGODB_URI = "mongodb+srv://mumin:M43M2TFgLfGvhBwY@muminai.tm6x81b.mongodb.net/?retryWrites=true&w=majority&appName=muminAI"
-SERVICE_ID = "srv-d29qsb1r0fns73e52vig"
+MONGODB_URI = os.environ.get('MONGODB_URI') or "mongodb+srv://mumin:M43M2TFgLfGvhBwY@muminai.tm6x81b.mongodb.net/?retryWrites=true&w=majority&appName=muminAI"
+SERVICE_ID = os.environ.get('SERVICE_ID') or "srv-d29qsb1r0fns73e52vig"
 INSTANCE_ID = os.environ.get('RENDER_INSTANCE_ID') or f"pid-{os.getpid()}"
-# כמה זמן נחשב נעילה כ"מיושנת" (ברירת מחדל 15 דקות)
-LOCK_STALE_SECONDS = int(os.environ.get('LOCK_STALE_SECONDS', '900'))
+
+# פרמטרים לנעילה (Lease + Heartbeat)
+LOCK_LEASE_SECONDS = int(os.environ.get('LOCK_LEASE_SECONDS', '60'))
+LOCK_HEARTBEAT_INTERVAL = max(5, int(LOCK_LEASE_SECONDS * 0.4))
+LOCK_WAIT_FOR_ACQUIRE = os.environ.get('LOCK_WAIT_FOR_ACQUIRE', 'false').lower() == 'true'
+LOCK_ACQUIRE_MAX_WAIT = int(os.environ.get('LOCK_ACQUIRE_MAX_WAIT', '0'))  # 0 = ללא גבול
+
+# אובייקטים גלובליים לניהול heartbeat
+_lock_stop_event = threading.Event()
+_lock_heartbeat_thread = None
+
+def _ensure_lock_indexes(collection):
+    """יוצר אינדקס TTL על expiresAt ואינדקס ייחודי על _id (מובנה)."""
+    try:
+        # TTL על expiresAt (expireAfterSeconds=0 כדי שיפוג בדיוק בזמן)
+        collection.create_index("expiresAt", expireAfterSeconds=0, background=True)
+    except Exception as e:
+        logger.warning(f"יצירת אינדקס TTL נכשלה/כבר קיים: {e}")
+
+def _start_heartbeat(client):
+    """מפעיל heartbeat חוטי שמאריך את ה-lease עד שהבוט נסגר."""
+    global _lock_heartbeat_thread
+
+    def _beat():
+        collection = client.bot_locks.service_locks
+        while not _lock_stop_event.is_set():
+            time.sleep(LOCK_HEARTBEAT_INTERVAL)
+            now = datetime.now(timezone.utc)
+            new_expiry = now + timedelta(seconds=LOCK_LEASE_SECONDS)
+            try:
+                res = collection.update_one(
+                    {"_id": SERVICE_ID, "owner": INSTANCE_ID},
+                    {"$set": {"expiresAt": new_expiry, "updatedAt": now}}
+                )
+                if res.matched_count == 0:
+                    logger.error("איבדנו את הנעילה במהלך הריצה - יוצא כדי למנוע קונפליקט")
+                    os._exit(0)
+            except Exception as e:
+                logger.error(f"שגיאה בעדכון heartbeat לנעילה: {e}")
+                # נסיון נוסף בסיבוב הבא; אם זה נמשך, ה-TTL ישחרר לבד
+
+    _lock_heartbeat_thread = threading.Thread(target=_beat, daemon=True)
+    _lock_heartbeat_thread.start()
 
 def cleanup_mongo_lock():
-    """מנקה את נעילת MongoDB בעת יציאה מהתוכנית"""
+    """שחרור הנעילה והפסקת heartbeat בעת יציאה."""
     try:
+        _lock_stop_event.set()
         client = pymongo.MongoClient(MONGODB_URI)
         db = client.bot_locks
         collection = db.service_locks
-        
-        result = collection.delete_one({"_id": SERVICE_ID})
+        result = collection.delete_one({"_id": SERVICE_ID, "owner": INSTANCE_ID})
         if result.deleted_count > 0:
             logger.info("נעילת MongoDB שוחררה בהצלחה")
         else:
-            logger.debug("לא נמצאה נעילה למחיקה")
-            
+            logger.debug("לא נמצאה נעילה בבעלותנו למחיקה")
     except Exception as e:
         logger.error(f"שגיאה בשחרור נעילת MongoDB: {e}")
 
 def manage_mongo_lock():
-    """מנהל נעילה חזקה ב-MongoDB למניעת ריצה כפולה של הבוט"""
+    """רכישת נעילה מבוזרת (Lease) עם Heartbeat ו-TTL, עם המתנה אופציונלית לרכישה."""
     try:
         client = pymongo.MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
         db = client.bot_locks
         collection = db.service_locks
+        _ensure_lock_indexes(collection)
 
-        now = datetime.now(timezone.utc)
-        lock_document = {
-            "_id": SERVICE_ID,  # שימוש ב-_id כדי להבטיח ייחודיות אטומית
-            "locked_at": now,
-            "instance_id": INSTANCE_ID,
-            "host": os.environ.get('RENDER_SERVICE_NAME', 'unknown')
-        }
+        start_time = time.time()
+        attempt = 0
+        while True:
+            attempt += 1
+            now = datetime.now(timezone.utc)
+            new_expiry = now + timedelta(seconds=LOCK_LEASE_SECONDS)
+            try:
+                doc = collection.find_one_and_update(
+                    {
+                        "_id": SERVICE_ID,
+                        "$or": [
+                            {"expiresAt": {"$lte": now}},  # נעילה פגה
+                            {"owner": INSTANCE_ID},          # או שכבר בבעלותנו
+                        ]
+                    },
+                    {
+                        "$set": {
+                            "owner": INSTANCE_ID,
+                            "host": os.environ.get('RENDER_SERVICE_NAME', 'unknown'),
+                            "updatedAt": now,
+                            "expiresAt": new_expiry,
+                        },
+                        "$setOnInsert": {
+                            "createdAt": now
+                        }
+                    },
+                    upsert=True,
+                    return_document=ReturnDocument.AFTER
+                )
 
-        try:
-            # ניסיון לרכוש נעילה ע"י יצירת מסמך עם _id קבוע
-            collection.insert_one(lock_document)
-            logger.info(f"נעילת MongoDB נרכשה בהצלחה עבור {SERVICE_ID} (instance: {INSTANCE_ID})")
-            atexit.register(cleanup_mongo_lock)
-            return
-        except DuplicateKeyError:
-            # כבר קיימת נעילה - בדיקת מיושנות
-            existing = collection.find_one({"_id": SERVICE_ID}) or {}
-            locked_time = existing.get("locked_at")
-            if isinstance(locked_time, datetime) and (now - locked_time) > timedelta(seconds=LOCK_STALE_SECONDS):
-                logger.warning("זוהתה נעילה מיושנת - מנסה להשתלט עליה בבטחה")
-                # ניסיון לשחרר ולקחת מחדש (ייתכנו מירוצים, מטפלים ב-DuplicateKeyError)
-                collection.delete_one({"_id": SERVICE_ID})
-                try:
-                    collection.insert_one(lock_document)
-                    logger.info("הנעילה המיושנת נלקחה בהצלחה")
+                if doc and doc.get("owner") == INSTANCE_ID:
+                    logger.info(f"נעילת MongoDB נרכשה בהצלחה עבור {SERVICE_ID} (instance: {INSTANCE_ID})")
+                    _start_heartbeat(client)
                     atexit.register(cleanup_mongo_lock)
                     return
-                except DuplicateKeyError:
-                    logger.info("תהליך אחר השיג את הנעילה במקביל - יוצא כדי למנוע קונפליקט")
+
+                # לא נרכשה - יש בעלים אחר ועדיין בתוקף
+                if not LOCK_WAIT_FOR_ACQUIRE:
+                    logger.info("תהליך אחר מחזיק בנעילה - יוצא נקי")
                     sys.exit(0)
 
-            logger.info(f"תהליך אחר של הבוט כבר רץ (נעול מאז: {locked_time or 'לא ידוע'}). יוצא נקי")
-            sys.exit(0)
+                # המתנה עם backoff ואקראיות קלה כדי לצמצם מירוצים
+                waited = time.time() - start_time
+                if LOCK_ACQUIRE_MAX_WAIT and waited >= LOCK_ACQUIRE_MAX_WAIT:
+                    logger.error("חרגנו מזמן ההמתנה לנעילה - יוצא כדי למנוע קונפליקט")
+                    sys.exit(0)
+
+                sleep_s = min(5.0, 0.5 + random.random())
+                if attempt % 20 == 0:
+                    logger.info("ממתין לשחרור נעילה מתהליך אחר...")
+                time.sleep(sleep_s)
+                continue
+
+            except Exception as e:
+                logger.error(f"שגיאה בניסיון רכישת נעילת MongoDB: {e}")
+                # המתנה קצרה וניסיון נוסף, למקרה של תקלה רגעית
+                time.sleep(1.0)
+                if attempt >= 5 and not LOCK_WAIT_FOR_ACQUIRE:
+                    sys.exit(0)
 
     except Exception as e:
         logger.error(f"שגיאה בניהול נעילת MongoDB: {e}")
@@ -388,7 +458,12 @@ admin_help - עזרה לאדמין (אדמין)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בשגיאות"""
-    logger.error(f"שגיאה: {context.error}")
+    err = context.error
+    # במקרה של Conflict שמגיע מעומק ה-Polling, נתעד ברמה נמוכה יותר
+    if isinstance(err, Conflict) or (hasattr(err, "message") and "Conflict" in str(err)):
+        logger.warning("זוהתה התנגשות getUpdates (Conflict) - ייתכן שתהליך אחר התחיל. נסגר בחן.")
+        return
+    logger.error(f"שגיאה: {err}")
 
 async def _post_init(application: Application) -> None:
     """Callback אסינכרוני שירוץ בעת אתחול האפליקציה בתוך הלופ של PTB.
@@ -444,7 +519,12 @@ def main():
         asyncio.get_running_loop()
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
-    application.run_polling(drop_pending_updates=True)
+    try:
+        application.run_polling(drop_pending_updates=True)
+    except Conflict:
+        # אם בכל זאת קרה, נסיים בשקט כדי לא לזהם לוגים
+        logger.info("Conflict מזוהה בעת run_polling - יוצא נקי (instance אחר פעיל)")
+        return
 
 if __name__ == '__main__':
     main()
