@@ -373,7 +373,15 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 📊 `/stats_month` - סטטיסטיקות שימוש לחודש האחרון
 ❓ `/admin_help` - הצגת רשימת פקודות זו
 
-**הערה:** כל הפקודות זמינות רק לבעל הבוט."""
+**הערה:** כל הפקודות זמינות רק לבעל הבוט.
+
+**להגדרת פקודות ב-BotFather:**
+```
+start - התחל שיחה עם הבוט
+stats_week - סטטיסטיקות שבועיות (אדמין)
+stats_month - סטטיסטיקות חודשיות (אדמין) 
+admin_help - עזרה לאדמין (אדמין)
+```"""
     
     await update.message.reply_text(help_message, parse_mode='Markdown')
 
