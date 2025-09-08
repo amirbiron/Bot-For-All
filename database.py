@@ -201,6 +201,102 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"שגיאה בניקוי נתונים: {e}")
 
+    def get_active_user_ids(self, days: int = 7) -> List[int]:
+        """מחזיר רשימת מזהי משתמשים ייחודיים שהיו פעילים ב-X הימים האחרונים
+        פעילות נמדדת לפי טבלת bot_stats ולפי פניות ב-customer_requests
+        """
+        try:
+            since_expr = f"-" + str(int(days)) + " days"
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+
+                # משתמשים מטבלת הסטטיסטיקות
+                cursor.execute(
+                    """
+                    SELECT DISTINCT user_id
+                    FROM bot_stats
+                    WHERE timestamp > datetime('now', ?)
+                    """,
+                    (since_expr,)
+                )
+                stats_users = {row[0] for row in cursor.fetchall()}
+
+                # משתמשים מטבלת הפניות
+                cursor.execute(
+                    """
+                    SELECT DISTINCT user_id
+                    FROM customer_requests
+                    WHERE created_at > datetime('now', ?)
+                    """,
+                    (since_expr,)
+                )
+                request_users = {row[0] for row in cursor.fetchall()}
+
+                all_users = sorted(stats_users.union(request_users))
+                return all_users
+        except Exception as e:
+            logger.error(f"שגיאה בקבלת משתמשים פעילים: {e}")
+            return []
+
+    def get_recent_users_with_details(self, days: int = 7) -> List[Dict]:
+        """מחזיר משתמשים פעילים ב-X ימים אחרונים כולל פרטי תצוגה וזמן אחרון
+        מחזיר רשומות במבנה: {user_id, username, full_name, last_seen}
+        """
+        try:
+            user_ids = self.get_active_user_ids(days)
+            if not user_ids:
+                return []
+
+            results: List[Dict] = []
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+
+                for uid in user_ids:
+                    # שליפת פרטי משתמש (username/full_name) מהבקשה האחרונה אם קיימת
+                    cursor.execute(
+                        """
+                        SELECT username, full_name
+                        FROM customer_requests
+                        WHERE user_id = ?
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """,
+                        (uid,)
+                    )
+                    row = cursor.fetchone()
+                    username = row["username"] if row else None
+                    full_name = row["full_name"] if row else None
+
+                    # שליפת זמן אחרון מכל הטבלאות
+                    cursor.execute(
+                        """
+                        SELECT MAX(ts) as last_seen
+                        FROM (
+                            SELECT timestamp as ts FROM bot_stats WHERE user_id = ?
+                            UNION ALL
+                            SELECT created_at as ts FROM customer_requests WHERE user_id = ?
+                        )
+                        """,
+                        (uid, uid)
+                    )
+                    ts_row = cursor.fetchone()
+                    last_seen = ts_row["last_seen"] if ts_row and ts_row["last_seen"] else None
+
+                    results.append({
+                        "user_id": uid,
+                        "username": username,
+                        "full_name": full_name,
+                        "last_seen": last_seen,
+                    })
+
+            # מיין לפי זמן אחרון יורד (None בסוף)
+            results.sort(key=lambda r: (r["last_seen"] is None, r["last_seen"]), reverse=True)
+            return results
+        except Exception as e:
+            logger.error(f"שגיאה בקבלת פרטי משתמשים פעילים: {e}")
+            return []
+
 # אינסטנס גלובלי של מנהל בסיס הנתונים
 db = DatabaseManager()
 
@@ -216,3 +312,7 @@ def log_action(user_id: int, action: str, data: Dict = None):
 def get_stats() -> Dict:
     """פונקציה מקוצרת לקבלת סטטיסטיקות"""
     return db.get_user_stats()
+
+def get_active_users(days: int = 7) -> List[Dict]:
+    """פונקציה מקוצרת לקבלת משתמשים פעילים והפרטים שלהם"""
+    return db.get_recent_users_with_details(days)

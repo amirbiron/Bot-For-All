@@ -11,10 +11,14 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.error import Conflict
 from flask import Flask, jsonify
 import threading
+import database
 import pymongo
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
-from activity_reporter import create_reporter
+try:
+    from activity_reporter import create_reporter
+except Exception:
+    create_reporter = None
 
 # הגדרת לוגים
 logging.basicConfig(
@@ -43,13 +47,6 @@ def run_flask():
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 OWNER_CHAT_ID = os.getenv('OWNER_CHAT_ID')
 
-# יצירת activity reporter
-reporter = create_reporter(
-    mongodb_uri="mongodb+srv://mumin:M43M2TFgLfGvhBwY@muminai.tm6x81b.mongodb.net/?retryWrites=true&w=majority&appName=muminAI",
-    service_id="srv-d29qsb1r0fns73e52vig",
-    service_name="BotForAll"
-)
-
 # MongoDB URI לנעילה
 MONGODB_URI = os.environ.get('MONGODB_URI') or "mongodb+srv://mumin:M43M2TFgLfGvhBwY@muminai.tm6x81b.mongodb.net/?retryWrites=true&w=majority&appName=muminAI"
 SERVICE_ID = os.environ.get('SERVICE_ID') or "srv-d29qsb1r0fns73e52vig"
@@ -61,6 +58,24 @@ LOCK_HEARTBEAT_INTERVAL = max(5, int(LOCK_LEASE_SECONDS * 0.4))
 LOCK_WAIT_FOR_ACQUIRE = os.environ.get('LOCK_WAIT_FOR_ACQUIRE', 'false').lower() == 'true'
 LOCK_ACQUIRE_MAX_WAIT = int(os.environ.get('LOCK_ACQUIRE_MAX_WAIT', '0'))  # 0 = ללא גבול
 
+# אתחול activity reporter
+class _NoopReporter:
+    def report_activity(self, *args, **kwargs):
+        pass
+
+if create_reporter is not None:
+    try:
+        reporter = create_reporter(
+            mongodb_uri="mongodb+srv://mumin:M43M2TFgLfGvhBwY@muminai.tm6x81b.mongodb.net/?retryWrites=true&w=majority&appName=muminAI",
+            service_id="srv-d29qsb1r0fns73e52vig",
+            service_name="BotForAll"
+        )
+    except Exception as e:
+        logger.warning(f"יצירת reporter נכשלה: {e}")
+        reporter = _NoopReporter()
+else:
+    reporter = _NoopReporter()
+
 # אובייקטים גלובליים לניהול heartbeat
 _lock_stop_event = threading.Event()
 _lock_heartbeat_thread = None
@@ -68,7 +83,6 @@ _lock_heartbeat_thread = None
 def _ensure_lock_indexes(collection):
     """יוצר אינדקס TTL על expiresAt ואינדקס ייחודי על _id (מובנה)."""
     try:
-        # TTL על expiresAt (expireAfterSeconds=0 כדי שיפוג בדיוק בזמן)
         collection.create_index("expiresAt", expireAfterSeconds=0, background=True)
     except Exception as e:
         logger.warning(f"יצירת אינדקס TTL נכשלה/כבר קיים: {e}")
@@ -93,7 +107,6 @@ def _start_heartbeat(client):
                     os._exit(0)
             except Exception as e:
                 logger.error(f"שגיאה בעדכון heartbeat לנעילה: {e}")
-                # נסיון נוסף בסיבוב הבא; אם זה נמשך, ה-TTL ישחרר לבד
 
     _lock_heartbeat_thread = threading.Thread(target=_beat, daemon=True)
     _lock_heartbeat_thread.start()
@@ -128,7 +141,6 @@ def manage_mongo_lock():
             now = datetime.now(timezone.utc)
             new_expiry = now + timedelta(seconds=LOCK_LEASE_SECONDS)
             try:
-                # שלב 1: נסה לתפוס/להאריך נעילה קיימת שפגה או בבעלותנו (ללא upsert)
                 doc = collection.find_one_and_update(
                     {
                         "_id": SERVICE_ID,
@@ -156,7 +168,6 @@ def manage_mongo_lock():
                     atexit.register(cleanup_mongo_lock)
                     return
 
-                # שלב 2: אם אין נעילה שתפוג או בבעלותנו, אז ננסה ליצור חדשה באמצעות insert
                 try:
                     collection.insert_one(
                         {
@@ -173,15 +184,12 @@ def manage_mongo_lock():
                     atexit.register(cleanup_mongo_lock)
                     return
                 except DuplicateKeyError:
-                    # תהליך אחר יצר את הרשומה במקביל — מתייחסים כ"נעילה לא הושגה"
                     pass
 
-                # לא נרכשה - יש בעלים אחר ועדיין בתוקף
                 if not LOCK_WAIT_FOR_ACQUIRE:
                     logger.info("תהליך אחר מחזיק בנעילה - יוצא נקי")
                     sys.exit(0)
 
-                # המתנה עם backoff ואקראיות קלה כדי לצמצם מירוצים
                 waited = time.time() - start_time
                 if LOCK_ACQUIRE_MAX_WAIT and waited >= LOCK_ACQUIRE_MAX_WAIT:
                     logger.error("חרגנו מזמן ההמתנה לנעילה - יוצא כדי למנוע קונפליקט")
@@ -274,9 +282,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         WELCOME_MESSAGE,
         reply_markup=create_main_keyboard()
     )
+    try:
+        database.log_action(user.id, 'start', {
+            'username': user.username,
+            'full_name': user.full_name,
+        })
+    except Exception as e:
+        logger.warning(f"לא ניתן לרשום סטטיסטיקת start: {e}")
 
 async def handle_whatsapp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בכפתור וואטסאפ"""
+    reporter.report_activity(update.effective_user.id)
     from config import WHATSAPP_NUMBER
     whatsapp_number = WHATSAPP_NUMBER
     whatsapp_link = f"https://wa.me/{whatsapp_number.replace('+', '')}"
@@ -286,17 +302,29 @@ async def handle_whatsapp(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         parse_mode='Markdown',
         reply_markup=create_main_keyboard()
     )
+    try:
+        user = update.effective_user
+        database.log_action(user.id, 'open_whatsapp')
+    except Exception as e:
+        logger.debug(f"log_action open_whatsapp נכשל: {e}")
 
 async def handle_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בכפתור מידע"""
+    reporter.report_activity(update.effective_user.id)
     await update.message.reply_text(
         SERVICE_INFO,
         parse_mode='Markdown',
         reply_markup=create_main_keyboard()
     )
+    try:
+        user = update.effective_user
+        database.log_action(user.id, 'view_info')
+    except Exception as e:
+        logger.debug(f"log_action view_info נכשל: {e}")
 
 async def handle_share_friend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בכפתור שלח לחבר"""
+    reporter.report_activity(update.effective_user.id)
     share_message = """ראיתי בוט שעוזר לבנות בוטים לטלגרם בקלות ובמחיר נוח.
     
 אם מעניין אותך - 
@@ -308,9 +336,15 @@ https://t.me/BotForAll4_Bot
         share_message,
         reply_markup=create_main_keyboard()
     )
+    try:
+        user = update.effective_user
+        database.log_action(user.id, 'share_to_friend')
+    except Exception as e:
+        logger.debug(f"log_action share_to_friend נכשל: {e}")
 
 async def handle_callback_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בבקשה לחזרה"""
+    reporter.report_activity(update.effective_user.id)
     user_id = update.effective_user.id
     user_states[user_id] = 'waiting_for_details'
     
@@ -318,9 +352,14 @@ async def handle_callback_request(update: Update, context: ContextTypes.DEFAULT_
         CONTACT_REQUEST,
         reply_markup=create_main_keyboard()
     )
+    try:
+        database.log_action(user_id, 'callback_request_opened')
+    except Exception as e:
+        logger.debug(f"log_action callback_request_opened נכשל: {e}")
 
 async def handle_contact_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בפרטי קשר שהמשתמש שלח"""
+    reporter.report_activity(update.effective_user.id)
     user = update.effective_user
     user_id = user.id
     message_text = update.message.text
@@ -349,13 +388,21 @@ async def handle_contact_details(update: Update, context: ContextTypes.DEFAULT_T
         except Exception as e:
             logger.error(f"שגיאה בשליחת הודעה לבעל הבוט: {e}")
     
+    # רישום למסד הנתונים
+    try:
+        database.log_action(user_id, 'contact_details_submitted')
+        # ניסיון לשמור בקשת לקוח
+        database.save_request(user_id, user.username or '', user.full_name or '', message_text)
+    except Exception as e:
+        logger.debug(f"רישום למסד הנתונים נכשל: {e}")
+    
     # איפוס מצב המשתמש
     user_states.pop(user_id, None)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בהודעות טקסט רגילות"""
+    reporter.report_activity(update.effective_user.id)
     user = update.effective_user
-    reporter.report_activity(user.id)
     text = update.message.text
     
     # טיפול בכפתורים ראשונים - לפני בדיקת מצב המשתמש
@@ -375,6 +422,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "אני כאן לעזור! בחר באחת מהאפשרויות למטה 👇",
             reply_markup=create_main_keyboard()
         )
+        try:
+            database.log_action(user.id, 'free_text_message')
+        except Exception as e:
+            logger.debug(f"log_action free_text_message נכשל: {e}")
 
 async def stats_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """הצגת סטטיסטיקות שבועיות - רק לבעל הבוט"""
@@ -493,6 +544,53 @@ async def _post_init(application: Application) -> None:
     except Exception as e:
         logger.warning(f"נכשלה הסרת webhook: {e}")
 
+def _is_admin(user_id: int) -> bool:
+    """בודק אם המשתמש הוא האדמין המוגדר"""
+    return bool(OWNER_CHAT_ID) and str(user_id) == str(OWNER_CHAT_ID)
+
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """פקודת אדמין: סטטיסטיקות שימוש שבוע/חודש, כולל מי השתמש"""
+    user = update.effective_user
+    reporter.report_activity(user.id)
+    if not _is_admin(user.id):
+        await update.message.reply_text("אין לך הרשאה לפקודה זו ❌")
+        return
+
+    try:
+        week_users = database.get_active_users(7)
+        month_users = database.get_active_users(30)
+
+        def format_users(users, limit=50):
+            lines = []
+            for idx, u in enumerate(users[:limit], start=1):
+                name = u.get('full_name') or 'לא ידוע'
+                username = (('@' + u['username']) if u.get('username') else '—')
+                lines.append(f"{idx}. {name} {username} | ID: {u.get('user_id')}")
+            if len(users) > limit:
+                lines.append(f"... ועוד {len(users) - limit} משתמשים")
+            return "\n".join(lines) if lines else "(אין נתונים)"
+
+        text = (
+            "📊 סטטיסטיקות שימוש\n\n" +
+            f"בשבוע האחרון: {len(week_users)} משתמשים ייחודיים\n" +
+            format_users(week_users) +
+            "\n\n" +
+            f"בחודש האחרון: {len(month_users)} משתמשים ייחודיים\n" +
+            format_users(month_users)
+        )
+
+        await update.message.reply_text(text)
+        try:
+            database.log_action(user.id, 'admin_stats_view', {
+                'week_count': len(week_users),
+                'month_count': len(month_users),
+            })
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"שגיאה בפקודת admin_stats: {e}")
+        await update.message.reply_text("אירעה שגיאה בעת שליפת הסטטיסטיקות ❌")
+
 def main():
     """פונקציה ראשית"""
     # ניהול נעילת MongoDB למניעת ריצה מרובה
@@ -522,6 +620,7 @@ def main():
     
     # הוספת handlers
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("admin_stats", admin_stats))
     application.add_handler(CommandHandler("stats_week", stats_week))
     application.add_handler(CommandHandler("stats_month", stats_month))
     application.add_handler(CommandHandler("admin_help", admin_help))
