@@ -5,6 +5,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from flask import Flask, jsonify
 import threading
+from activity_reporter import create_reporter
 
 # הגדרת לוגים
 logging.basicConfig(
@@ -32,6 +33,13 @@ def run_flask():
 # הגדרות מהסביבה
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 OWNER_CHAT_ID = os.getenv('OWNER_CHAT_ID')
+
+# יצירת activity reporter
+reporter = create_reporter(
+    mongodb_uri="mongodb+srv://mumin:M43M2TFgLfGvhBwY@muminai.tm6x81b.mongodb.net/?retryWrites=true&w=majority&appName=muminAI",
+    service_id="srv-d29qsb1r0fns73e52vig",
+    service_name="BotForAll"
+)
 
 # הודעות
 WELCOME_MESSAGE = """
@@ -93,6 +101,7 @@ def create_main_keyboard():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """פונקציית /start"""
     user = update.effective_user
+    reporter.report_activity(user.id)
     logger.info(f"המשתמש {user.full_name} התחיל שיחה")
     
     # אפס את מצב המשתמש
@@ -183,6 +192,7 @@ async def handle_contact_details(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בהודעות טקסט רגילות"""
     user = update.effective_user
+    reporter.report_activity(user.id)
     text = update.message.text
     
     # טיפול בכפתורים ראשונים - לפני בדיקת מצב המשתמש
@@ -202,6 +212,97 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "אני כאן לעזור! בחר באחת מהאפשרויות למטה 👇",
             reply_markup=create_main_keyboard()
         )
+
+async def stats_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """הצגת סטטיסטיקות שבועיות - רק לבעל הבוט"""
+    user = update.effective_user
+    
+    # בדיקה שזה בעל הבוט
+    if str(user.id) != OWNER_CHAT_ID:
+        await update.message.reply_text("אין לך הרשאה לצפות בסטטיסטיקות.")
+        return
+    
+    reporter.report_activity(user.id)
+    
+    # קבלת סטטיסטיקות שבועיות
+    stats = reporter.get_weekly_stats()
+    
+    if "error" in stats:
+        await update.message.reply_text(f"שגיאה בקבלת סטטיסטיקות: {stats['error']}")
+        return
+    
+    # עיצוב הודעת הסטטיסטיקות
+    message = f"""📊 **סטטיסטיקות שימוש - {stats['period']}**
+
+👥 **משתמשים ייחודיים:** {stats['unique_users']}
+🔄 **סך הפעילויות:** {stats['total_activities']}
+
+📅 **פירוט יומי:**"""
+    
+    # הוספת פירוט יומי
+    for day_stat in stats['daily_breakdown'][:7]:  # רק 7 הימים האחרונים
+        date_formatted = day_stat['date']
+        users_count = day_stat['unique_users_count']
+        activities_count = day_stat['total_activities']
+        message += f"\n• {date_formatted}: {users_count} משתמשים, {activities_count} פעילויות"
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def stats_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """הצגת סטטיסטיקות חודשיות - רק לבעל הבוט"""
+    user = update.effective_user
+    
+    # בדיקה שזה בעל הבוט
+    if str(user.id) != OWNER_CHAT_ID:
+        await update.message.reply_text("אין לך הרשאה לצפות בסטטיסטיקות.")
+        return
+    
+    reporter.report_activity(user.id)
+    
+    # קבלת סטטיסטיקות חודשיות
+    stats = reporter.get_monthly_stats()
+    
+    if "error" in stats:
+        await update.message.reply_text(f"שגיאה בקבלת סטטיסטיקות: {stats['error']}")
+        return
+    
+    # עיצוב הודעת הסטטיסטיקות
+    message = f"""📊 **סטטיסטיקות שימוש - {stats['period']}**
+
+👥 **משתמשים ייחודיים:** {stats['unique_users']}
+🔄 **סך הפעילויות:** {stats['total_activities']}
+
+📅 **פירוט יומי (10 הימים האחרונים):**"""
+    
+    # הוספת פירוט יומי - רק 10 הימים האחרונים
+    for day_stat in stats['daily_breakdown'][:10]:
+        date_formatted = day_stat['date']
+        users_count = day_stat['unique_users_count']
+        activities_count = day_stat['total_activities']
+        message += f"\n• {date_formatted}: {users_count} משתמשים, {activities_count} פעילויות"
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """הצגת עזרה לבעל הבוט"""
+    user = update.effective_user
+    
+    # בדיקה שזה בעל הבוט
+    if str(user.id) != OWNER_CHAT_ID:
+        await update.message.reply_text("אין לך הרשאה לצפות בפקודות ניהול.")
+        return
+    
+    reporter.report_activity(user.id)
+    
+    help_message = """🔧 **פקודות ניהול זמינות:**
+
+📊 `/stats_week` - סטטיסטיקות שימוש לשבוע האחרון
+📊 `/stats_month` - סטטיסטיקות שימוש לחודש האחרון
+❓ `/admin_help` - הצגת רשימת פקודות זו
+
+**הערה:** כל הפקודות זמינות רק לבעל הבוט."""
+    
+    await update.message.reply_text(help_message, parse_mode='Markdown')
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בשגיאות"""
@@ -227,6 +328,9 @@ def main():
     
     # הוספת handlers
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stats_week", stats_week))
+    application.add_handler(CommandHandler("stats_month", stats_month))
+    application.add_handler(CommandHandler("admin_help", admin_help))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # הוספת error handler
