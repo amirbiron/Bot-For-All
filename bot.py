@@ -3,7 +3,7 @@ import logging
 import os
 import sys
 import atexit
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from flask import Flask, jsonify
@@ -49,6 +49,9 @@ reporter = create_reporter(
 # MongoDB URI לנעילה
 MONGODB_URI = "mongodb+srv://mumin:M43M2TFgLfGvhBwY@muminai.tm6x81b.mongodb.net/?retryWrites=true&w=majority&appName=muminAI"
 SERVICE_ID = "srv-d29qsb1r0fns73e52vig"
+INSTANCE_ID = os.environ.get('RENDER_INSTANCE_ID') or f"pid-{os.getpid()}"
+# כמה זמן נחשב נעילה כ"מיושנת" (ברירת מחדל 15 דקות)
+LOCK_STALE_SECONDS = int(os.environ.get('LOCK_STALE_SECONDS', '900'))
 
 def cleanup_mongo_lock():
     """מנקה את נעילת MongoDB בעת יציאה מהתוכנית"""
@@ -57,7 +60,7 @@ def cleanup_mongo_lock():
         db = client.bot_locks
         collection = db.service_locks
         
-        result = collection.delete_one({"service_id": SERVICE_ID})
+        result = collection.delete_one({"_id": SERVICE_ID})
         if result.deleted_count > 0:
             logger.info("נעילת MongoDB שוחררה בהצלחה")
         else:
@@ -67,52 +70,50 @@ def cleanup_mongo_lock():
         logger.error(f"שגיאה בשחרור נעילת MongoDB: {e}")
 
 def manage_mongo_lock():
-    """מנהל את נעילת MongoDB למניעת ריצה מרובה של הבוט"""
+    """מנהל נעילה חזקה ב-MongoDB למניעת ריצה כפולה של הבוט"""
     try:
-        client = pymongo.MongoClient(MONGODB_URI)
+        client = pymongo.MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
         db = client.bot_locks
         collection = db.service_locks
-        
-        # יצירת אינדקס ייחודי על service_id אם לא קיים
-        try:
-            collection.create_index("service_id", unique=True)
-        except:
-            pass  # האינדקס כבר קיים
-        
-        # ניסיון ליצור מסמך נעילה
+
+        now = datetime.utcnow()
         lock_document = {
-            "service_id": SERVICE_ID,
-            "locked_at": datetime.utcnow(),
-            "process_info": {
-                "pid": os.getpid() if hasattr(os, 'getpid') else None,
-                "host": os.environ.get('RENDER_SERVICE_NAME', 'unknown'),
-                "instance": os.environ.get('RENDER_INSTANCE_ID', 'unknown')
-            }
+            "_id": SERVICE_ID,  # שימוש ב-_id כדי להבטיח ייחודיות אטומית
+            "locked_at": now,
+            "instance_id": INSTANCE_ID,
+            "host": os.environ.get('RENDER_SERVICE_NAME', 'unknown')
         }
-        
+
         try:
+            # ניסיון לרכוש נעילה ע"י יצירת מסמך עם _id קבוע
             collection.insert_one(lock_document)
-            logger.info(f"נעילת MongoDB נרכשה בהצלחה עבור {SERVICE_ID}")
-            
-            # רישום פונקציית הניקוי לרוץ ביציאה
+            logger.info(f"נעילת MongoDB נרכשה בהצלחה עבור {SERVICE_ID} (instance: {INSTANCE_ID})")
             atexit.register(cleanup_mongo_lock)
-            
+            return
         except DuplicateKeyError:
-            # הנעילה כבר תפוסה על ידי תהליך אחר
-            existing_lock = collection.find_one({"service_id": SERVICE_ID})
-            if existing_lock:
-                locked_time = existing_lock.get('locked_at', 'לא ידוע')
-                logger.info(f"תהליך אחר של הבוט כבר רץ (נעול מאז: {locked_time})")
-                logger.info("יוצא בצורה נקייה כדי למנוע קונפליקט טלגרם")
-            else:
-                logger.info("תהליך אחר של הבוט כבר רץ")
-            
+            # כבר קיימת נעילה - בדיקת מיושנות
+            existing = collection.find_one({"_id": SERVICE_ID}) or {}
+            locked_time = existing.get("locked_at")
+            if isinstance(locked_time, datetime) and (now - locked_time) > timedelta(seconds=LOCK_STALE_SECONDS):
+                logger.warning("זוהתה נעילה מיושנת - מנסה להשתלט עליה בבטחה")
+                # ניסיון לשחרר ולקחת מחדש (ייתכנו מירוצים, מטפלים ב-DuplicateKeyError)
+                collection.delete_one({"_id": SERVICE_ID})
+                try:
+                    collection.insert_one(lock_document)
+                    logger.info("הנעילה המיושנת נלקחה בהצלחה")
+                    atexit.register(cleanup_mongo_lock)
+                    return
+                except DuplicateKeyError:
+                    logger.info("תהליך אחר השיג את הנעילה במקביל - יוצא כדי למנוע קונפליקט")
+                    sys.exit(0)
+
+            logger.info(f"תהליך אחר של הבוט כבר רץ (נעול מאז: {locked_time or 'לא ידוע'}). יוצא נקי")
             sys.exit(0)
-            
+
     except Exception as e:
         logger.error(f"שגיאה בניהול נעילת MongoDB: {e}")
-        logger.error("ממשיך בכל זאת - ייתכן שיהיה קונפליקט")
-        # לא יוצאים במקרה של שגיאה כדי לא לשבור את הבוט לגמרי
+        logger.error("לא ניתן להבטיח נעילה - יוצא כדי למנוע קונפליקט")
+        sys.exit(0)
 
 # הודעות
 WELCOME_MESSAGE = """
@@ -409,6 +410,13 @@ def main():
     
     # יצירת האפליקציה
     application = Application.builder().token(BOT_TOKEN).build()
+    
+    # ודא שאין webhook פעיל כדי למנוע קונפליקט מסוג אחר
+    try:
+        asyncio.run(application.bot.delete_webhook(drop_pending_updates=True))
+        logger.info("Webhook הוסר בהצלחה (אם היה)")
+    except Exception as e:
+        logger.warning(f"נכשלה הסרת webhook: {e}")
     
     # הוספת handlers
     application.add_handler(CommandHandler("start", start))
