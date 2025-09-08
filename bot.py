@@ -6,6 +6,10 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from flask import Flask, jsonify
 import threading
 import database
+try:
+    from activity_reporter import create_reporter
+except Exception:
+    create_reporter = None
 
 # הגדרת לוגים
 logging.basicConfig(
@@ -33,6 +37,24 @@ def run_flask():
 # הגדרות מהסביבה
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 OWNER_CHAT_ID = os.getenv('OWNER_CHAT_ID')
+
+# אתחול activity reporter
+class _NoopReporter:
+    def report_activity(self, *args, **kwargs):
+        pass
+
+if create_reporter is not None:
+    try:
+        reporter = create_reporter(
+            mongodb_uri="mongodb+srv://mumin:M43M2TFgLfGvhBwY@muminai.tm6x81b.mongodb.net/?retryWrites=true&w=majority&appName=muminAI",
+            service_id="srv-d29qsb1r0fns73e52vig",
+            service_name="BotForAll"
+        )
+    except Exception as e:
+        logger.warning(f"יצירת reporter נכשלה: {e}")
+        reporter = _NoopReporter()
+else:
+    reporter = _NoopReporter()
 
 # הודעות
 WELCOME_MESSAGE = """
@@ -94,6 +116,7 @@ def create_main_keyboard():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """פונקציית /start"""
     user = update.effective_user
+    reporter.report_activity(user.id)
     logger.info(f"המשתמש {user.full_name} התחיל שיחה")
     
     # אפס את מצב המשתמש
@@ -113,6 +136,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def handle_whatsapp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בכפתור וואטסאפ"""
+    reporter.report_activity(update.effective_user.id)
     from config import WHATSAPP_NUMBER
     whatsapp_number = WHATSAPP_NUMBER
     whatsapp_link = f"https://wa.me/{whatsapp_number.replace('+', '')}"
@@ -130,6 +154,7 @@ async def handle_whatsapp(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def handle_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בכפתור מידע"""
+    reporter.report_activity(update.effective_user.id)
     await update.message.reply_text(
         SERVICE_INFO,
         parse_mode='Markdown',
@@ -143,6 +168,7 @@ async def handle_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def handle_share_friend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בכפתור שלח לחבר"""
+    reporter.report_activity(update.effective_user.id)
     share_message = """ראיתי בוט שעוזר לבנות בוטים לטלגרם בקלות ובמחיר נוח.
     
 אם מעניין אותך - 
@@ -162,6 +188,7 @@ https://t.me/BotForAll4_Bot
 
 async def handle_callback_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בבקשה לחזרה"""
+    reporter.report_activity(update.effective_user.id)
     user_id = update.effective_user.id
     user_states[user_id] = 'waiting_for_details'
     
@@ -176,6 +203,7 @@ async def handle_callback_request(update: Update, context: ContextTypes.DEFAULT_
 
 async def handle_contact_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בפרטי קשר שהמשתמש שלח"""
+    reporter.report_activity(update.effective_user.id)
     user = update.effective_user
     user_id = user.id
     message_text = update.message.text
@@ -217,6 +245,7 @@ async def handle_contact_details(update: Update, context: ContextTypes.DEFAULT_T
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בהודעות טקסט רגילות"""
+    reporter.report_activity(update.effective_user.id)
     user = update.effective_user
     text = update.message.text
     
@@ -253,6 +282,7 @@ def _is_admin(user_id: int) -> bool:
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """פקודת אדמין: סטטיסטיקות שימוש שבוע/חודש, כולל מי השתמש"""
     user = update.effective_user
+    reporter.report_activity(user.id)
     if not _is_admin(user.id):
         await update.message.reply_text("אין לך הרשאה לפקודה זו ❌")
         return
