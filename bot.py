@@ -638,7 +638,13 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 def main():
     """פונקציה ראשית"""
-    # ניהול נעילת MongoDB למניעת ריצה מרובה
+    # הפעלת Flask בחוט נפרד מוקדם כדי לוודא שפורט נפתח עבור Render
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    logger.info("Flask server started")
+
+    # ניהול נעילת MongoDB למניעת ריצה מרובה (לאחר פתיחת הפורט)
     manage_mongo_lock()
     
     if not BOT_TOKEN:
@@ -647,12 +653,6 @@ def main():
     
     if not OWNER_CHAT_ID:
         logger.warning("OWNER_CHAT_ID לא מוגדר - לא תתקבלנה הודעות")
-    
-    # הפעלת Flask בחוט נפרד
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-    logger.info("Flask server started")
     
     # יצירת האפליקציה + הסרת webhook בתוך ה-loop של PTB באמצעות post_init
     application = (
