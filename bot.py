@@ -11,18 +11,14 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.error import Conflict
 from flask import Flask, jsonify
 import threading
-<<<<<<< HEAD
 import database
+import pymongo
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 try:
     from activity_reporter import create_reporter
 except Exception:
     create_reporter = None
-=======
-import pymongo
-from pymongo import ReturnDocument
-from pymongo.errors import DuplicateKeyError
-from activity_reporter import create_reporter
->>>>>>> origin/main
 
 # הגדרת לוגים
 logging.basicConfig(
@@ -51,7 +47,17 @@ def run_flask():
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 OWNER_CHAT_ID = os.getenv('OWNER_CHAT_ID')
 
-<<<<<<< HEAD
+# MongoDB URI לנעילה
+MONGODB_URI = os.environ.get('MONGODB_URI') or "mongodb+srv://mumin:M43M2TFgLfGvhBwY@muminai.tm6x81b.mongodb.net/?retryWrites=true&w=majority&appName=muminAI"
+SERVICE_ID = os.environ.get('SERVICE_ID') or "srv-d29qsb1r0fns73e52vig"
+INSTANCE_ID = os.environ.get('RENDER_INSTANCE_ID') or f"pid-{os.getpid()}"
+
+# פרמטרים לנעילה (Lease + Heartbeat)
+LOCK_LEASE_SECONDS = int(os.environ.get('LOCK_LEASE_SECONDS', '60'))
+LOCK_HEARTBEAT_INTERVAL = max(5, int(LOCK_LEASE_SECONDS * 0.4))
+LOCK_WAIT_FOR_ACQUIRE = os.environ.get('LOCK_WAIT_FOR_ACQUIRE', 'false').lower() == 'true'
+LOCK_ACQUIRE_MAX_WAIT = int(os.environ.get('LOCK_ACQUIRE_MAX_WAIT', '0'))  # 0 = ללא גבול
+
 # אתחול activity reporter
 class _NoopReporter:
     def report_activity(self, *args, **kwargs):
@@ -69,24 +75,6 @@ if create_reporter is not None:
         reporter = _NoopReporter()
 else:
     reporter = _NoopReporter()
-=======
-# יצירת activity reporter
-reporter = create_reporter(
-    mongodb_uri="mongodb+srv://mumin:M43M2TFgLfGvhBwY@muminai.tm6x81b.mongodb.net/?retryWrites=true&w=majority&appName=muminAI",
-    service_id="srv-d29qsb1r0fns73e52vig",
-    service_name="BotForAll"
-)
-
-# MongoDB URI לנעילה
-MONGODB_URI = os.environ.get('MONGODB_URI') or "mongodb+srv://mumin:M43M2TFgLfGvhBwY@muminai.tm6x81b.mongodb.net/?retryWrites=true&w=majority&appName=muminAI"
-SERVICE_ID = os.environ.get('SERVICE_ID') or "srv-d29qsb1r0fns73e52vig"
-INSTANCE_ID = os.environ.get('RENDER_INSTANCE_ID') or f"pid-{os.getpid()}"
-
-# פרמטרים לנעילה (Lease + Heartbeat)
-LOCK_LEASE_SECONDS = int(os.environ.get('LOCK_LEASE_SECONDS', '60'))
-LOCK_HEARTBEAT_INTERVAL = max(5, int(LOCK_LEASE_SECONDS * 0.4))
-LOCK_WAIT_FOR_ACQUIRE = os.environ.get('LOCK_WAIT_FOR_ACQUIRE', 'false').lower() == 'true'
-LOCK_ACQUIRE_MAX_WAIT = int(os.environ.get('LOCK_ACQUIRE_MAX_WAIT', '0'))  # 0 = ללא גבול
 
 # אובייקטים גלובליים לניהול heartbeat
 _lock_stop_event = threading.Event()
@@ -95,7 +83,6 @@ _lock_heartbeat_thread = None
 def _ensure_lock_indexes(collection):
     """יוצר אינדקס TTL על expiresAt ואינדקס ייחודי על _id (מובנה)."""
     try:
-        # TTL על expiresAt (expireAfterSeconds=0 כדי שיפוג בדיוק בזמן)
         collection.create_index("expiresAt", expireAfterSeconds=0, background=True)
     except Exception as e:
         logger.warning(f"יצירת אינדקס TTL נכשלה/כבר קיים: {e}")
@@ -120,7 +107,6 @@ def _start_heartbeat(client):
                     os._exit(0)
             except Exception as e:
                 logger.error(f"שגיאה בעדכון heartbeat לנעילה: {e}")
-                # נסיון נוסף בסיבוב הבא; אם זה נמשך, ה-TTL ישחרר לבד
 
     _lock_heartbeat_thread = threading.Thread(target=_beat, daemon=True)
     _lock_heartbeat_thread.start()
@@ -155,7 +141,6 @@ def manage_mongo_lock():
             now = datetime.now(timezone.utc)
             new_expiry = now + timedelta(seconds=LOCK_LEASE_SECONDS)
             try:
-                # שלב 1: נסה לתפוס/להאריך נעילה קיימת שפגה או בבעלותנו (ללא upsert)
                 doc = collection.find_one_and_update(
                     {
                         "_id": SERVICE_ID,
@@ -183,7 +168,6 @@ def manage_mongo_lock():
                     atexit.register(cleanup_mongo_lock)
                     return
 
-                # שלב 2: אם אין נעילה שתפוג או בבעלותנו, אז ננסה ליצור חדשה באמצעות insert
                 try:
                     collection.insert_one(
                         {
@@ -200,15 +184,12 @@ def manage_mongo_lock():
                     atexit.register(cleanup_mongo_lock)
                     return
                 except DuplicateKeyError:
-                    # תהליך אחר יצר את הרשומה במקביל — מתייחסים כ"נעילה לא הושגה"
                     pass
 
-                # לא נרכשה - יש בעלים אחר ועדיין בתוקף
                 if not LOCK_WAIT_FOR_ACQUIRE:
                     logger.info("תהליך אחר מחזיק בנעילה - יוצא נקי")
                     sys.exit(0)
 
-                # המתנה עם backoff ואקראיות קלה כדי לצמצם מירוצים
                 waited = time.time() - start_time
                 if LOCK_ACQUIRE_MAX_WAIT and waited >= LOCK_ACQUIRE_MAX_WAIT:
                     logger.error("חרגנו מזמן ההמתנה לנעילה - יוצא כדי למנוע קונפליקט")
@@ -230,7 +211,6 @@ def manage_mongo_lock():
         logger.error(f"שגיאה בניהול נעילת MongoDB: {e}")
         logger.error("לא ניתן להבטיח נעילה - יוצא כדי למנוע קונפליקט")
         sys.exit(0)
->>>>>>> origin/main
 
 # הודעות
 WELCOME_MESSAGE = """
@@ -423,7 +403,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """טיפול בהודעות טקסט רגילות"""
     reporter.report_activity(update.effective_user.id)
     user = update.effective_user
-    reporter.report_activity(user.id)
     text = update.message.text
     
     # טיפול בכפתורים ראשונים - לפני בדיקת מצב המשתמש
@@ -641,13 +620,10 @@ def main():
     
     # הוספת handlers
     application.add_handler(CommandHandler("start", start))
-<<<<<<< HEAD
     application.add_handler(CommandHandler("admin_stats", admin_stats))
-=======
     application.add_handler(CommandHandler("stats_week", stats_week))
     application.add_handler(CommandHandler("stats_month", stats_month))
     application.add_handler(CommandHandler("admin_help", admin_help))
->>>>>>> origin/main
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # הוספת error handler
