@@ -13,6 +13,7 @@ from flask import Flask, jsonify
 import threading
 import pymongo
 from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 from activity_reporter import create_reporter
 
 # הגדרת לוגים
@@ -127,12 +128,13 @@ def manage_mongo_lock():
             now = datetime.now(timezone.utc)
             new_expiry = now + timedelta(seconds=LOCK_LEASE_SECONDS)
             try:
+                # שלב 1: נסה לתפוס/להאריך נעילה קיימת שפגה או בבעלותנו (ללא upsert)
                 doc = collection.find_one_and_update(
                     {
                         "_id": SERVICE_ID,
                         "$or": [
-                            {"expiresAt": {"$lte": now}},  # נעילה פגה
-                            {"owner": INSTANCE_ID},          # או שכבר בבעלותנו
+                            {"expiresAt": {"$lte": now}},
+                            {"owner": INSTANCE_ID},
                         ]
                     },
                     {
@@ -142,12 +144,10 @@ def manage_mongo_lock():
                             "updatedAt": now,
                             "expiresAt": new_expiry,
                         },
-                        "$setOnInsert": {
-                            "createdAt": now
-                        }
+                        "$setOnInsert": {"createdAt": now},
                     },
-                    upsert=True,
-                    return_document=ReturnDocument.AFTER
+                    upsert=False,
+                    return_document=ReturnDocument.AFTER,
                 )
 
                 if doc and doc.get("owner") == INSTANCE_ID:
@@ -155,6 +155,26 @@ def manage_mongo_lock():
                     _start_heartbeat(client)
                     atexit.register(cleanup_mongo_lock)
                     return
+
+                # שלב 2: אם אין נעילה שתפוג או בבעלותנו, אז ננסה ליצור חדשה באמצעות insert
+                try:
+                    collection.insert_one(
+                        {
+                            "_id": SERVICE_ID,
+                            "owner": INSTANCE_ID,
+                            "host": os.environ.get('RENDER_SERVICE_NAME', 'unknown'),
+                            "createdAt": now,
+                            "updatedAt": now,
+                            "expiresAt": new_expiry,
+                        }
+                    )
+                    logger.info(f"נעילת MongoDB נוצרה ונרכשה בהצלחה עבור {SERVICE_ID} (instance: {INSTANCE_ID})")
+                    _start_heartbeat(client)
+                    atexit.register(cleanup_mongo_lock)
+                    return
+                except DuplicateKeyError:
+                    # תהליך אחר יצר את הרשומה במקביל — מתייחסים כ"נעילה לא הושגה"
+                    pass
 
                 # לא נרכשה - יש בעלים אחר ועדיין בתוקף
                 if not LOCK_WAIT_FOR_ACQUIRE:
@@ -175,7 +195,6 @@ def manage_mongo_lock():
 
             except Exception as e:
                 logger.error(f"שגיאה בניסיון רכישת נעילת MongoDB: {e}")
-                # המתנה קצרה וניסיון נוסף, למקרה של תקלה רגעית
                 time.sleep(1.0)
                 if attempt >= 5 and not LOCK_WAIT_FOR_ACQUIRE:
                     sys.exit(0)
