@@ -5,6 +5,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from flask import Flask, jsonify
 import threading
+import database
 
 # הגדרת לוגים
 logging.basicConfig(
@@ -102,6 +103,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         WELCOME_MESSAGE,
         reply_markup=create_main_keyboard()
     )
+    try:
+        database.log_action(user.id, 'start', {
+            'username': user.username,
+            'full_name': user.full_name,
+        })
+    except Exception as e:
+        logger.warning(f"לא ניתן לרשום סטטיסטיקת start: {e}")
 
 async def handle_whatsapp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בכפתור וואטסאפ"""
@@ -114,6 +122,11 @@ async def handle_whatsapp(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         parse_mode='Markdown',
         reply_markup=create_main_keyboard()
     )
+    try:
+        user = update.effective_user
+        database.log_action(user.id, 'open_whatsapp')
+    except Exception as e:
+        logger.debug(f"log_action open_whatsapp נכשל: {e}")
 
 async def handle_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בכפתור מידע"""
@@ -122,6 +135,11 @@ async def handle_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         parse_mode='Markdown',
         reply_markup=create_main_keyboard()
     )
+    try:
+        user = update.effective_user
+        database.log_action(user.id, 'view_info')
+    except Exception as e:
+        logger.debug(f"log_action view_info נכשל: {e}")
 
 async def handle_share_friend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בכפתור שלח לחבר"""
@@ -136,6 +154,11 @@ https://t.me/BotForAll4_Bot
         share_message,
         reply_markup=create_main_keyboard()
     )
+    try:
+        user = update.effective_user
+        database.log_action(user.id, 'share_to_friend')
+    except Exception as e:
+        logger.debug(f"log_action share_to_friend נכשל: {e}")
 
 async def handle_callback_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בבקשה לחזרה"""
@@ -146,6 +169,10 @@ async def handle_callback_request(update: Update, context: ContextTypes.DEFAULT_
         CONTACT_REQUEST,
         reply_markup=create_main_keyboard()
     )
+    try:
+        database.log_action(user_id, 'callback_request_opened')
+    except Exception as e:
+        logger.debug(f"log_action callback_request_opened נכשל: {e}")
 
 async def handle_contact_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בפרטי קשר שהמשתמש שלח"""
@@ -177,6 +204,14 @@ async def handle_contact_details(update: Update, context: ContextTypes.DEFAULT_T
         except Exception as e:
             logger.error(f"שגיאה בשליחת הודעה לבעל הבוט: {e}")
     
+    # רישום למסד הנתונים
+    try:
+        database.log_action(user_id, 'contact_details_submitted')
+        # ניסיון לשמור בקשת לקוח
+        database.save_request(user_id, user.username or '', user.full_name or '', message_text)
+    except Exception as e:
+        logger.debug(f"רישום למסד הנתונים נכשל: {e}")
+    
     # איפוס מצב המשתמש
     user_states.pop(user_id, None)
 
@@ -202,10 +237,60 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "אני כאן לעזור! בחר באחת מהאפשרויות למטה 👇",
             reply_markup=create_main_keyboard()
         )
+        try:
+            database.log_action(user.id, 'free_text_message')
+        except Exception as e:
+            logger.debug(f"log_action free_text_message נכשל: {e}")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בשגיאות"""
     logger.error(f"שגיאה: {context.error}")
+
+def _is_admin(user_id: int) -> bool:
+    """בודק אם המשתמש הוא האדמין המוגדר"""
+    return bool(OWNER_CHAT_ID) and str(user_id) == str(OWNER_CHAT_ID)
+
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """פקודת אדמין: סטטיסטיקות שימוש שבוע/חודש, כולל מי השתמש"""
+    user = update.effective_user
+    if not _is_admin(user.id):
+        await update.message.reply_text("אין לך הרשאה לפקודה זו ❌")
+        return
+
+    try:
+        week_users = database.get_active_users(7)
+        month_users = database.get_active_users(30)
+
+        def format_users(users, limit=50):
+            lines = []
+            for idx, u in enumerate(users[:limit], start=1):
+                name = u.get('full_name') or 'לא ידוע'
+                username = (('@' + u['username']) if u.get('username') else '—')
+                lines.append(f"{idx}. {name} {username} | ID: {u.get('user_id')}")
+            if len(users) > limit:
+                lines.append(f"... ועוד {len(users) - limit} משתמשים")
+            return "\n".join(lines) if lines else "(אין נתונים)"
+
+        text = (
+            "📊 סטטיסטיקות שימוש\n\n" +
+            f"בשבוע האחרון: {len(week_users)} משתמשים ייחודיים\n" +
+            format_users(week_users) +
+            "\n\n" +
+            f"בחודש האחרון: {len(month_users)} משתמשים ייחודיים\n" +
+            format_users(month_users)
+        )
+
+        await update.message.reply_text(text)
+        try:
+            database.log_action(user.id, 'admin_stats_view', {
+                'week_count': len(week_users),
+                'month_count': len(month_users),
+            })
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"שגיאה בפקודת admin_stats: {e}")
+        await update.message.reply_text("אירעה שגיאה בעת שליפת הסטטיסטיקות ❌")
 
 def main():
     """פונקציה ראשית"""
@@ -227,6 +312,7 @@ def main():
     
     # הוספת handlers
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("admin_stats", admin_stats))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # הוספת error handler
