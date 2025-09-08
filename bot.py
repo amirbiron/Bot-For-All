@@ -3,7 +3,7 @@ import logging
 import os
 import sys
 import atexit
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from flask import Flask, jsonify
@@ -76,7 +76,7 @@ def manage_mongo_lock():
         db = client.bot_locks
         collection = db.service_locks
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         lock_document = {
             "_id": SERVICE_ID,  # שימוש ב-_id כדי להבטיח ייחודיות אטומית
             "locked_at": now,
@@ -390,6 +390,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     """טיפול בשגיאות"""
     logger.error(f"שגיאה: {context.error}")
 
+async def _post_init(application: Application) -> None:
+    """Callback אסינכרוני שירוץ בעת אתחול האפליקציה בתוך הלופ של PTB.
+    משמש להסרת webhook מבלי לפתוח/לסגור event loop חיצוני."""
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook הוסר בהצלחה (אם היה)")
+    except Exception as e:
+        logger.warning(f"נכשלה הסרת webhook: {e}")
+
 def main():
     """פונקציה ראשית"""
     # ניהול נעילת MongoDB למניעת ריצה מרובה
@@ -408,15 +417,14 @@ def main():
     flask_thread.start()
     logger.info("Flask server started")
     
-    # יצירת האפליקציה
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # ודא שאין webhook פעיל כדי למנוע קונפליקט מסוג אחר
-    try:
-        asyncio.run(application.bot.delete_webhook(drop_pending_updates=True))
-        logger.info("Webhook הוסר בהצלחה (אם היה)")
-    except Exception as e:
-        logger.warning(f"נכשלה הסרת webhook: {e}")
+    # יצירת האפליקציה + הסרת webhook בתוך ה-loop של PTB באמצעות post_init
+    application = (
+        Application
+        .builder()
+        .token(BOT_TOKEN)
+        .post_init(_post_init)
+        .build()
+    )
     
     # הוספת handlers
     application.add_handler(CommandHandler("start", start))
@@ -431,6 +439,11 @@ def main():
     logger.info("הבוט מתחיל לפעול...")
     
     # הפעלת הבוט
+    # הבטחת event loop ברירת מחדל עבור Python 3.13 לפני קריאה פנימית ל-asyncio.get_event_loop()
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
