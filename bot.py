@@ -9,39 +9,17 @@ from datetime import datetime, timedelta, timezone
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import Conflict
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import threading
 import database
 import pymongo
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
+from logging_setup import setup_logging, update_log_level
 try:
     from activity_reporter import create_reporter
 except Exception:
     create_reporter = None
-
-# הגדרת לוגים
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# יצירת Flask app
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Bot is running!"
-
-@app.route('/health')
-def health():
-    return jsonify({"status": "healthy", "bot": "running"})
-
-def run_flask():
-    """מפעיל את Flask בחוט נפרד"""
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
 
 # הגדרות מהסביבה
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -57,6 +35,52 @@ LOCK_LEASE_SECONDS = int(os.environ.get('LOCK_LEASE_SECONDS', '60'))
 LOCK_HEARTBEAT_INTERVAL = max(5, int(LOCK_LEASE_SECONDS * 0.4))
 LOCK_WAIT_FOR_ACQUIRE = os.environ.get('LOCK_WAIT_FOR_ACQUIRE', 'false').lower() == 'true'
 LOCK_ACQUIRE_MAX_WAIT = int(os.environ.get('LOCK_ACQUIRE_MAX_WAIT', '0'))  # 0 = ללא גבול
+
+# אתחול לוגים גלובלי (JSON/Text לפי ENV) + קונטקסט שירות
+setup_logging({
+    "service_id": SERVICE_ID,
+    "instance_id": INSTANCE_ID,
+    "render_service": os.environ.get('RENDER_SERVICE_NAME', 'unknown'),
+})
+logger = logging.getLogger(__name__)
+
+# יצירת Flask app
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "bot": "running"})
+
+@app.route('/admin/loglevel', methods=['GET'])
+def admin_loglevel():
+    """שינוי/בדיקת רמת לוג בזמן ריצה. דרוש טוקן אבטחה."""
+    admin_token = os.environ.get('LOG_ADMIN_TOKEN')
+    if not admin_token:
+        return jsonify({"error": "endpoint disabled (missing LOG_ADMIN_TOKEN)"}), 404
+
+    provided = request.args.get('token') or request.headers.get('X-Admin-Token')
+    if provided != admin_token:
+        return jsonify({"error": "forbidden"}), 403
+
+    level = request.args.get('level')
+    if level:
+        new_level = update_log_level(level)
+        logger.info(f"עודכנה רמת לוג: {new_level}")
+        return jsonify({"status": "ok", "level": new_level})
+
+    # ללא פרמטר level מחזיר את הרמה הנוכחית
+    current = logging.getLevelName(logging.getLogger().level)
+    return jsonify({"status": "ok", "level": current})
+
+def run_flask():
+    """מפעיל את Flask בחוט נפרד"""
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
+
 
 # אתחול activity reporter
 class _NoopReporter:
@@ -136,6 +160,10 @@ def manage_mongo_lock():
 
         start_time = time.time()
         attempt = 0
+        logger.info(
+            f"מתחיל ניסיון רכישת נעילה (lease={LOCK_LEASE_SECONDS}s, heartbeat={LOCK_HEARTBEAT_INTERVAL}s, "
+            f"wait={'on' if LOCK_WAIT_FOR_ACQUIRE else 'off'}, max_wait={LOCK_ACQUIRE_MAX_WAIT or '∞'})"
+        )
         while True:
             attempt += 1
             now = datetime.now(timezone.utc)
@@ -187,12 +215,12 @@ def manage_mongo_lock():
                     pass
 
                 if not LOCK_WAIT_FOR_ACQUIRE:
-                    logger.info("תהליך אחר מחזיק בנעילה - יוצא נקי")
+                    logger.info("תהליך אחר מחזיק בנעילה - יוצא נקי (LOCK_WAIT_FOR_ACQUIRE=false)")
                     sys.exit(0)
 
                 waited = time.time() - start_time
                 if LOCK_ACQUIRE_MAX_WAIT and waited >= LOCK_ACQUIRE_MAX_WAIT:
-                    logger.error("חרגנו מזמן ההמתנה לנעילה - יוצא כדי למנוע קונפליקט")
+                    logger.error(f"חרגנו מזמן ההמתנה לנעילה אחרי {int(waited)} שניות - יוצא כדי למנוע קונפליקט")
                     sys.exit(0)
 
                 sleep_s = min(5.0, 0.5 + random.random())
@@ -202,7 +230,7 @@ def manage_mongo_lock():
                 continue
 
             except Exception as e:
-                logger.error(f"שגיאה בניסיון רכישת נעילת MongoDB: {e}")
+                logger.error(f"שגיאה בניסיון רכישת נעילת MongoDB (attempt={attempt}): {e}")
                 time.sleep(1.0)
                 if attempt >= 5 and not LOCK_WAIT_FOR_ACQUIRE:
                     sys.exit(0)

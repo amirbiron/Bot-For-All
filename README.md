@@ -64,18 +64,45 @@
 - שלח `/start`
 - בדוק שכל הכפתורים עובדים
 
-## 📁 מבנה הפרויקט
+## 🧾 לוגים – עבודה נוחה ומתקדמת
 
+כדי שיהיה קל לפתור תקלות ולעקוב אחרי מה שקורה בפרודקשן, הוספנו לוגים מובנים עם קונטקסט ושינוי רמת לוג בזמן ריצה.
+
+### הגדרות מומלצות ב-Render
+- `LOG_FORMAT = json` — יצוא לוגים בפורמט JSON המתאים למסננים ב-Render
+- `LOG_LEVEL = INFO` — רמת הלוג ברירת מחדל (`DEBUG`/`INFO`/`WARNING`/`ERROR`)
+- `LOG_ADMIN_TOKEN = <טוקן סודי>` — מאפשר לשנות רמת לוג בזמן ריצה (ראו למטה)
+
+שדות לוג עיקריים (ב-JSON):
+- `service_id`, `instance_id`, `render_service`, `pid`
+- `level`, `logger`, `msg`, `file`, `line`, `func`, `ts`
+
+דוגמת הודעת נעילה משודרגת:
+```json
+{"ts":"...","level":"INFO","msg":"תהליך אחר מחזיק בנעילה - יוצא נקי (LOCK_WAIT_FOR_ACQUIRE=false)","service_id":"...","instance_id":"...","render_service":"..."}
 ```
-telegram-bot/
-├── bot.py              # הקובץ הראשי של הבוט
-├── config.py           # הגדרות ומשתני סביבה
-├── messages.py         # כל הטקסטים וההודעות
-├── database.py         # ניהול בסיס נתונים פשוט
-├── requirements.txt    # תלויות Python
-├── Procfile           # הגדרות הרצה ב-Render
-└── README.md          # המדריך הזה
+
+### שינוי רמת לוג בזמן ריצה
+קיים endpoint מאובטח ב-HTTP:
+
+- בדיקת הרמה הנוכחית:
+```bash
+curl -s "https://<SERVICE_URL>/admin/loglevel?token=<LOG_ADMIN_TOKEN>"
 ```
+
+- עדכון לרמת DEBUG (זמנית לזמן בירור תקלה):
+```bash
+curl -s "https://<SERVICE_URL>/admin/loglevel?token=<LOG_ADMIN_TOKEN>&level=DEBUG"
+```
+
+הערות:
+- אם `LOG_ADMIN_TOKEN` לא מוגדר – ה-endpoint מנוטרל.
+- שינוי הרמה הוא מידי ולא דורש פריסה מחדש.
+
+### טיפים למסנון לוגים ב-Render
+- חיפוש לפי טקסט: `"נעילה"` או `"MongoDB"`
+- בפורמט JSON: סנן לפי `level:ERROR` או `msg:Conflict` וכו'.
+- לזהות ריצות מקבילות: חפשו לפי `instance_id` שונה באותו `service_id`.
 
 ## ⚙️ התאמה אישית
 
